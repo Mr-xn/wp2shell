@@ -1,0 +1,88 @@
+# wp2shell lab — parameterised WordPress + MySQL.
+#   WP_TAG=6.9.4 docker compose up -d   # vulnerable (default)
+#   WP_TAG=7.0.2 docker compose up -d   # patched
+#   WP_TAG=6.8.3 docker compose up -d   # SQLi-only (needs facilitating plugin)
+#
+# FILE privilege + shared volume (mysql-init.sql) are optional and ONLY
+# needed for UNION SELECT INTO OUTFILE testing.  Omit mysql-init.sql to
+# model a normal/managed host where the chain is read-only SQLi.
+name: wp2shell-lab
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wpuser
+      MYSQL_PASSWORD: wppass
+    command:
+      - --secure-file-priv=
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - wp_data:/var/www/html:rw
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  wp:
+    image: wordpress:${WP_TAG:-6.9.4}-php8.2-apache
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WP_PORT:-8889}:80"
+    volumes:
+      - wp_data:/var/www/html
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wpuser
+      WORDPRESS_DB_PASSWORD: wppass
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_HOME',    'http://localhost:${WP_PORT:-8889}');
+        define('WP_SITEURL', 'http://localhost:${WP_PORT:-8889}');
+
+  wpcli:
+    image: wordpress:cli
+    depends_on:
+      db:
+        condition: service_healthy
+      wp:
+        condition: service_started
+    volumes:
+      - wp_data:/var/www/html
+    user: "33:33"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wpuser
+      WORDPRESS_DB_PASSWORD: wppass
+      WORDPRESS_DB_NAME: wordpress
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /var/www/html/wp-config.php ]; do sleep 2; done
+        until wp core is-installed 2>/dev/null; do
+          wp core install \
+            --url="http://localhost:${WP_PORT:-8889}" \
+            --title="wp2shell-lab" \
+            --admin_user=admin \
+            --admin_password='Admin!2345' \
+            --admin_email=admin@lab.test \
+            --skip-email 2>/dev/null || sleep 3
+        done
+        wp rewrite structure '/%postname%/' --hard >/dev/null 2>&1 || true
+        wp rewrite flush --hard >/dev/null 2>&1 || true
+        chmod 777 /var/www/html/wp-content/uploads
+        echo "[wpcli] WordPress $$(wp core version) installed; posts: $$(wp post list --post_status=publish --format=count)"
+        echo "LAB READY"
+
+volumes:
+  db_data:
+  wp_data:

